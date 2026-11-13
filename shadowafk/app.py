@@ -143,7 +143,14 @@ class Controller(QObject):
     def templates(self):
         rows = self.rows("SELECT * FROM templates ORDER BY id DESC")
         for row in rows:
-            row["url"] = QUrl.fromLocalFile(str(self.directory / row["path"])).toString()
+            row["path"] = str(self.directory / row["path"])
+            row["url"] = QUrl.fromLocalFile(row["path"]).toString()
+            row["builtin"] = False
+        for path in sorted(Path(__file__).with_name("ui").joinpath("templates").glob("*.png")):
+            state, reference_width = path.stem.split("-")
+            rows.append(dict(name=LABELS[state][0] + " · Встроенный", state=state,
+                             reference_width=int(reference_width), path=str(path),
+                             url=QUrl.fromLocalFile(str(path)).toString(), builtin=True))
         return rows
 
     @Property("QVariantList", notify=changed)
@@ -187,7 +194,7 @@ class Controller(QObject):
             self.patterns = []
             for row in self.templates:
                 try:
-                    self.patterns.append((row["state"], load_gray(self.directory / row["path"]), row["reference_width"]))
+                    self.patterns.append((row["state"], load_gray(row["path"]), row["reference_width"]))
                 except (OSError, ValueError, cv2.error):
                     self.log(f"Недоступен шаблон: {row['name']}")
             if not self.patterns:

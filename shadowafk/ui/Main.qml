@@ -561,7 +561,7 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 Image { source: modelData.url; Layout.preferredWidth: 130; Layout.preferredHeight: 65; fillMode: Image.PreserveAspectFit }
                                 Caption { text: modelData.name + " · " + modelData.state; Layout.fillWidth: true }
-                                Action { text: "Удалить"; danger: true; enabled: !root.session.active; onClicked: backend.removeTemplate(modelData.id) }
+                                Action { text: "Удалить"; danger: true; visible: !modelData.builtin; enabled: !root.session.active; onClicked: backend.removeTemplate(modelData.id) }
                             }
                         }
                     }
