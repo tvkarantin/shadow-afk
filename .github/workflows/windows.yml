@@ -21,7 +21,15 @@ jobs:
           architecture: x64
           cache: pip
       - name: Install Inno Setup
-        run: choco install innosetup --version=6.4.3 --yes --no-progress
+        shell: pwsh
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $compiler)) {
+            choco install innosetup --version=6.4.3 --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          if (!(Test-Path $compiler)) { throw "Inno Setup compiler not found" }
+          "ISCC=$compiler" >> $env:GITHUB_ENV
       - name: Build and test
         shell: cmd
         run: build.bat
