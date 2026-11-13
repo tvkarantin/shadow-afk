@@ -18,8 +18,9 @@ STAGES = [
 ]
 LABELS = {key: (title, hint) for key, title, hint in STAGES}
 LABELS["VICTORY"] = ("Королевская победа", "Шаблон баннера победы")
+LABELS["REPLAY_BUTTON"] = ("Играть снова", "Шаблон кнопки на итоговом экране")
 TRANSITIONS = {
-    "UNKNOWN": set(LABELS) - {"VICTORY"},
+    "UNKNOWN": set(LABELS) - {"VICTORY", "REPLAY_BUTTON"},
     "LOBBY": {"MATCHMAKING", "LOADING", "WAITING_FOR_PLAYERS", "BATTLE_BUS", "IN_MATCH"},
     "MATCHMAKING": {"LOBBY", "LOADING", "WAITING_FOR_PLAYERS", "BATTLE_BUS", "IN_MATCH"},
     "LOADING": {"LOBBY", "WAITING_FOR_PLAYERS", "BATTLE_BUS", "IN_MATCH"},
@@ -162,6 +163,10 @@ def detect(frame, templates, threshold, state_thresholds=None, current="", cance
     reason = ""
     if score < minimum:
         reason = "Совпадение ниже порога"
-    elif len(ranked) > 1 and score - ranked[1][1][0] < (0.05 if current and state != current else 0.03):
+    elif any(
+        score - other_score < (0.05 if current and state != current else 0.03)
+        for other_state, (other_score, _, _) in ranked[1:]
+        if {state, other_state} != {"RESULTS", "REPLAY_BUTTON"}
+    ):
         reason = "Неоднозначное совпадение"
     return Detection(state if not reason else "", max(0, score), box, state, name, reason)

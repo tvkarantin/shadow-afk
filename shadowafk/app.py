@@ -147,6 +147,7 @@ class Controller(QObject):
         return dict(active=active, paused=self.paused, title=title, hint=hint, games=self.match.detected,
                     cycles=self.match.completed, seconds=int(self.active_time()), stage=self.stage,
                     mode=self.mode, state=self.match.state, confidence=self.confidence, action=self.action,
+                    suggestion=self.manual_suggestion(active),
                     capture=str(self.capture_state), previous=self.match.previous,
                     matchId=str(self.match.match_id or ""), candidate=self.detection.candidate,
                     template=self.detection.template, reason=self.detection.reason,
@@ -154,6 +155,15 @@ class Controller(QObject):
                     confirmations=self.match.confirmations or self.match.last_confirmed,
                     frameAge=-1 if self.last_frame is None else round(monotonic() - self.last_frame, 1),
                     preview=f"image://capture/{self.preview_revision}" if self.preview_visible else "")
+
+    def manual_suggestion(self, active):
+        if not active or self.paused or self.mode != "live":
+            return ""
+        if self.match.state == "LOBBY":
+            return "В лобби нажмите «Играть» в Fortnite."
+        if self.match.state == "RESULTS":
+            return "На итоговом экране нажмите «Играть снова», чтобы начать новый матч."
+        return ""
 
     @Property("QVariantList", constant=True)
     def stages(self):
@@ -205,7 +215,8 @@ class Controller(QObject):
     @Property(str, notify=changed)
     def missingCritical(self):
         return ", ".join(LABELS[state][0] for state in ("LOBBY", "IN_MATCH", "RESULTS")
-                         if not self.template_counts.get(state))
+                         if not self.template_counts.get(state) and
+                         (state != "RESULTS" or not self.template_counts.get("REPLAY_BUTTON")))
 
     @Property("QVariantList", notify=changed)
     def diagnostics(self):
@@ -461,6 +472,9 @@ class Controller(QObject):
                         self.victory_frames = 0
                     if self.detection.candidate:
                         self.state_scores[self.detection.candidate] = f"{self.confidence:.0%}"
+                    # The replay button is a results-screen marker, never an input target.
+                    if state == "REPLAY_BUTTON":
+                        state = "RESULTS"
                     if state and state != self.match.state and state not in TRANSITIONS[self.match.state]:
                         self.detection = replace(self.detection, reason="Переход из текущего состояния не подтверждён")
                     if self.detection.reason and self.detection.candidate:

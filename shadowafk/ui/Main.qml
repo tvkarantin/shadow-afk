@@ -397,6 +397,12 @@ ApplicationWindow {
                         Heading { text: "Визуальный монитор" }
                         Caption {
                             Layout.fillWidth: true
+                            visible: !!root.session.suggestion
+                            text: root.session.suggestion
+                            color: "#9cafff"
+                        }
+                        Caption {
+                            Layout.fillWidth: true
                             visible: !!backend.missingCritical
                             color: "#ffd17a"
                             text: "Отсутствуют шаблоны: " + backend.missingCritical
@@ -551,7 +557,7 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             spacing: 9
                             Action { text: "+ Открыть изображение"; primary: true; onClicked: templateFile.open() }
-                            ComboBox { id: templateState; model: backend.stages.concat([{key: "VICTORY", title: "Королевская победа"}]); textRole: "title"; valueRole: "key" }
+                            ComboBox { id: templateState; model: backend.stages.concat([{key: "VICTORY", title: "Королевская победа"}, {key: "REPLAY_BUTTON", title: "Играть снова (результаты)"}]); textRole: "title"; valueRole: "key" }
                             SpinBox { id: referenceWidth; from: 6; to: 16000; value: 1920; editable: true }
                             Action {
                                 text: "Сохранить шаблон"
