@@ -9,31 +9,39 @@ from time import monotonic
 
 import cv2
 from PySide6.QtCore import QObject, Property, QStandardPaths, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QImage
 from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuick import QQuickImageProvider
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from shadowafk.capture import capture, windows
 from shadowafk.match import LABELS, STAGES, Match, load_gray, recognize
 
 
-def process_frame(window, templates, threshold, preview):
+def process_frame(window, templates, threshold):
     error, frame = capture(window["handle"], window["pid"])
     if frame is None:
-        return error, 0, False
+        return error, 0, None
     state, confidence, box = recognize(frame, templates, threshold)
     if box:
         x, y, w, h = box
         cv2.rectangle(frame, (x, y), (x+w, y+h), 255, max(2, frame.shape[1] // 500))
     if frame.shape[1] > 800:
         frame = cv2.resize(frame, (800, round(frame.shape[0] * 800 / frame.shape[1])))
-    encoded, data = cv2.imencode(".png", frame)
-    if not encoded:
-        raise ValueError("Не удалось сохранить предпросмотр")
-    temporary = preview.with_suffix(".tmp")
-    temporary.write_bytes(data.tobytes())
-    temporary.replace(preview)
-    return state, confidence, True
+    height, width = frame.shape
+    preview = QImage(frame.tobytes(), width, height, width, QImage.Format_Grayscale8)
+    return state, confidence, preview.copy()
+
+
+class PreviewProvider(QQuickImageProvider):
+    def __init__(self):
+        super().__init__(QQuickImageProvider.Image)
+        self.frame = QImage()
+
+    def requestImage(self, image_id, size, requested_size):
+        size.setWidth(self.frame.width())
+        size.setHeight(self.frame.height())
+        return self.frame
 
 
 class Controller(QObject):
@@ -46,7 +54,7 @@ class Controller(QObject):
         super().__init__()
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.preview = directory / "preview.png"
+        self.preview = PreviewProvider()
         self.preview_revision = 0
         self.db = sqlite3.connect(directory / "shadowafk.sqlite")
         self.db.row_factory = sqlite3.Row
@@ -110,8 +118,7 @@ class Controller(QObject):
         return dict(active=active, paused=self.paused, title=title, hint=hint, games=self.match.detected,
                     cycles=self.match.completed, seconds=int(self.active_time()), stage=self.stage,
                     mode=self.mode, state=self.match.state, confidence=self.confidence, action=self.action,
-                    preview=(QUrl.fromLocalFile(str(self.preview)).toString()
-                             + f"?v={self.preview_revision}") if self.preview_visible else "")
+                    preview=f"image://capture/{self.preview_revision}" if self.preview_visible else "")
 
     @Property("QVariantList", constant=True)
     def stages(self):
@@ -261,11 +268,13 @@ class Controller(QObject):
             self.future = None
             if generation == self.generation:
                 try:
-                    state, self.confidence, self.preview_visible = job.result()
+                    state, self.confidence, frame = job.result()
                 except Exception as error:
                     self.log(f"Ошибка захвата: {error}")
-                    state, self.confidence, self.preview_visible = "ERROR", 0, False
+                    state, self.confidence, frame = "ERROR", 0, None
+                self.preview_visible = frame is not None
                 if self.preview_visible:
+                    self.preview.frame = frame
                     self.preview_revision += 1
                 self.observe(state, 3)
         if self.session is None or self.paused:
@@ -288,7 +297,7 @@ class Controller(QObject):
             elif self.future is None:
                 self.job_generation = self.generation
                 self.future = self.executor.submit(process_frame, self.window, self.patterns,
-                                                   self.config["threshold"] / 100, self.preview)
+                                                   self.config["threshold"] / 100)
                 self.next_step = now + 0.65
         elapsed = int(self.active_time())
         if elapsed != self.last_checkpoint:
@@ -405,7 +414,6 @@ class Controller(QObject):
         self.timer.stop()
         self.stop("Закрыто")
         self.executor.shutdown(wait=True, cancel_futures=True)
-        self.preview.unlink(missing_ok=True)
         self.db.close()
 
 
@@ -425,6 +433,7 @@ def main():
         directory = Path(temporary.name)
     controller = Controller(directory)
     engine = QQmlApplicationEngine()
+    engine.addImageProvider("capture", controller.preview)
     engine.rootContext().setContextProperty("backend", controller)
     engine.load(QUrl.fromLocalFile(str(ui / "Main.qml")))
     if not engine.rootObjects():
