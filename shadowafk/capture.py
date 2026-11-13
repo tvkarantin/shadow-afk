@@ -86,7 +86,7 @@ def windows():
     return entries
 
 
-def capture(handle, expected_pid):
+def capture(handle, expected_pid, color=False):
     from mss import mss
 
     ctypes, types, user, _ = _windows_api()
@@ -105,13 +105,13 @@ def capture(handle, expected_pid):
     set_dpi.restype = ctypes.c_void_p
     previous = set_dpi(ctypes.c_void_p(-4))  # Per-monitor aware v2.
     try:
-        return capture_client(handle, ctypes, types, user, mss)
+        return capture_client(handle, ctypes, types, user, mss, color)
     finally:
         if previous:
             set_dpi(previous)
 
 
-def capture_client(handle, ctypes, types, user, mss):
+def capture_client(handle, ctypes, types, user, mss, color=False):
     rect, origin = types.RECT(), types.POINT()
     if not user.GetClientRect(handle, ctypes.byref(rect)) or not user.ClientToScreen(handle, ctypes.byref(origin)):
         return CaptureState.CAPTURE_ERROR, None
@@ -134,4 +134,6 @@ def capture_client(handle, ctypes, types, user, mss):
     frame = cv2.cvtColor(pixels, cv2.COLOR_BGRA2GRAY)
     if frame.max() < 8:
         return CaptureState.NO_FRAME, None
+    if color:
+        return CaptureState.FRAME_AVAILABLE, (pixels[:, :, :3].copy(), (origin.x, origin.y, width, height))
     return CaptureState.FRAME_AVAILABLE, frame

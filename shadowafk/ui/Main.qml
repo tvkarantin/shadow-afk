@@ -17,11 +17,11 @@ ApplicationWindow {
     property bool trayAvailable: false
     property int page: 0
     property var session: backend.status
-    property var pages: ["Обзор", "Мониторинг", "Награды", "Шаблоны", "Статистика", "Настройки", "Журнал", "Telegram"]
+    property var pages: ["Обзор", "Мониторинг", "Награды", "Шаблоны", "Статистика", "Настройки", "Журнал", "Telegram", "Studio"]
     property var subtitles: ["Контроль циклов, прогресса и состояния сессии",
         "Видимый кадр и подтверждённое состояние", "Ручной учёт прогресса заданий",
-        "Образцы экранов и кнопок", "История сессий и экспорт", "Параметры наблюдения и симуляции", "События приложения", "Персональные уведомления"]
-    property var icons: ["▦", "◎", "◈", "▧", "▥", "⚙", "≡", "↗"]
+        "Образцы экранов и кнопок", "История сессий и экспорт", "Параметры наблюдения и симуляции", "События приложения", "Персональные уведомления", "Движение и автонажатия в Fortnite"]
+    property var icons: ["▦", "◎", "◈", "▧", "▥", "⚙", "≡", "↗", "▶"]
     property var screenshot: ""
     property var beforeImage: ""
     property var afterImage: ""
@@ -336,7 +336,7 @@ ApplicationWindow {
                                         enabled: root.session.active
                                         onClicked: backend.pause()
                                     }
-                                    Action { text: "■ Стоп"; danger: true; enabled: root.session.active; onClicked: backend.stop() }
+                                    Action { text: "■ Стоп"; danger: true; enabled: root.session.active || studio.status.active; onClicked: backend.stop() }
                                 }
                                 RowLayout {
                                     Layout.fillWidth: true
@@ -765,6 +765,66 @@ ApplicationWindow {
                                 palette.windowText: "#f2f5fc"
                                 onClicked: telegram.preference(modelData.key, checked)
                             }
+                        }
+                    }
+                    Card {
+                        visible: root.page === 8
+                        Heading { text: "Управление Studio" }
+                        Caption { Layout.fillWidth: true; text: studio.status.message }
+                        Action {
+                            primary: !studio.status.active
+                            danger: studio.status.active
+                            enabled: backend.windowsSupported
+                            text: studio.status.active ? "Остановить (F6)" : "Запустить (F6)"
+                            onClicked: studio.toggle()
+                        }
+                        Caption {
+                            Layout.fillWidth: true
+                            text: "Клавиш: " + studio.status.keys + "   •   Кликов: " + studio.status.clicks
+                                  + "   •   Следующее нажатие: " + studio.status.next + "   •   " + root.duration(studio.status.seconds)
+                        }
+                        Action { text: "Открыть журнал"; onClicked: root.page = 6 }
+                    }
+                    Card {
+                        visible: root.page === 8
+                        Heading { text: "Движение и кнопки" }
+                        CheckBox {
+                            id: studioMovement
+                            text: "Движение WASD и прыжки"
+                            checked: studio.settings.movement
+                        }
+                        RowLayout {
+                            Caption { text: "Интервал от" }
+                            SpinBox { id: studioLow; from: 1; to: 120; value: studio.settings.low; editable: true }
+                            Caption { text: "до" }
+                            SpinBox { id: studioHigh; from: studioLow.value; to: 120; value: studio.settings.high; editable: true }
+                            Caption { text: "секунд" }
+                        }
+                        CheckBox { id: studioClicks; text: "Автонажатия «Играть» и «Играть снова»"; checked: studio.settings.clicks }
+                        RowLayout {
+                            Caption { text: "Порог совпадения, %" }
+                            SpinBox { id: studioThreshold; from: 55; to: 96; value: studio.settings.threshold; editable: true }
+                        }
+                        Action {
+                            text: "Сохранить настройки Studio"
+                            onClicked: studio.configure(studioLow.value, studioHigh.value, studioThreshold.value,
+                                                        studioMovement.checked, studioClicks.checked)
+                        }
+                    }
+                    Card {
+                        visible: root.page === 8
+                        Heading { text: "Запись кнопок Fortnite" }
+                        Caption {
+                            Layout.fillWidth: true
+                            text: "Наведите курсор на центр кнопки в Fortnite и нажмите F7 или F8. F9 закрывает Shadow AFK."
+                        }
+                        RowLayout {
+                            Action { text: "F7 · Играть"; enabled: backend.windowsSupported; onClicked: studio.record("play") }
+                            Caption { text: studio.status.play }
+                        }
+                        RowLayout {
+                            Action { text: "F8 · Играть снова"; enabled: backend.windowsSupported; onClicked: studio.record("replay") }
+                            Caption { text: studio.status.replay }
                         }
                     }
                     Item { implicitHeight: 22 }

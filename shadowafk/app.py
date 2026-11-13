@@ -18,6 +18,7 @@ from PySide6.QtQuick import QQuickImageProvider
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from shadowafk.telegram import Telegram
+from shadowafk.studio import Studio
 from shadowafk.capture import CaptureState, capture, windows
 from shadowafk.hotkey import EmergencyHotkey, STOP_KEYS
 from shadowafk.match import LABELS, STAGES, TRANSITIONS, Detection, Match, Pattern, detect, load_gray
@@ -92,6 +93,7 @@ class Controller(QObject):
         if self.config["stopKey"] not in tuple(STOP_KEYS):
             self.config["stopKey"] = "Ctrl+Alt+Q"
         self.hotkey = None
+        self.studio = None
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.future = None
         self.telegram = None
@@ -394,6 +396,8 @@ class Controller(QObject):
 
     @Slot()
     def stop(self, result="Остановлено"):
+        if self.studio:
+            self.studio.stop()
         if self.session is None:
             return
         self.cancel_pending()
@@ -472,7 +476,6 @@ class Controller(QObject):
                         self.victory_frames = 0
                     if self.detection.candidate:
                         self.state_scores[self.detection.candidate] = f"{self.confidence:.0%}"
-                    # The replay button is a results-screen marker, never an input target.
                     if state == "REPLAY_BUTTON":
                         state = "RESULTS"
                     if state and state != self.match.state and state not in TRANSITIONS[self.match.state]:
@@ -654,6 +657,8 @@ class Controller(QObject):
             self.hotkey.close()
         self.timer.stop()
         self.stop("Закрыто")
+        if self.studio:
+            self.studio.close()
         if self.telegram:
             self.telegram.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -677,8 +682,10 @@ def main():
     controller = Controller(directory)
     telegram = Telegram(directory, offline=smoke)
     controller.telegram = telegram
+    controller.studio = Studio(controller, enabled=not smoke)
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("telegram", telegram)
+    engine.rootContext().setContextProperty("studio", controller.studio)
     engine.addImageProvider("capture", controller.preview)
     engine.rootContext().setContextProperty("backend", controller)
     engine.load(QUrl.fromLocalFile(str(ui / "Main.qml")))
@@ -687,7 +694,7 @@ def main():
         return 1
     window = engine.rootObjects()[0]
     if smoke:
-        for page in range(1, 8):
+        for page in range(1, 9):
             window.setProperty("page", page)
             app.processEvents()
         window.setProperty("page", 0)
@@ -706,6 +713,7 @@ def main():
     if sys.platform == "win32" and not smoke:
         controller.hotkey = EmergencyHotkey(app, controller)
         controller.hotkey.register(controller.settings["stopKey"])
+        controller.hotkey.register_studio(controller.studio)
         controller.settingsChanged.emit()
     app.aboutToQuit.connect(controller.close)
     if smoke:

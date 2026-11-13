@@ -1,4 +1,4 @@
-"""Register the emergency stop with Windows without intercepting game input."""
+"""Register global shortcuts through the Windows hotkey API."""
 import ctypes
 from ctypes import wintypes
 
@@ -18,6 +18,7 @@ class EmergencyHotkey(QAbstractNativeEventFilter):
         self.controller = controller
         self.user = ctypes.WinDLL("user32", use_last_error=True)
         self.registered = False
+        self.studio_keys = {}
         app.installNativeEventFilter(self)
 
     def register(self, sequence):
@@ -31,12 +32,26 @@ class EmergencyHotkey(QAbstractNativeEventFilter):
             self.controller.notify.emit("Глобальная клавиша занята. Используйте «Стоп» в приложении.")
         return self.registered
 
+    def register_studio(self, studio):
+        shortcuts = [studio.toggle, lambda: studio.record("play"),
+                     lambda: studio.record("replay"), self.app.quit]
+        for number, callback in enumerate(shortcuts, start=6):
+            if self.user.RegisterHotKey(None, number, 0x4000, 0x70 + number - 1):
+                self.studio_keys[number] = callback
+            else:
+                self.controller.log(f"Глобальная клавиша F{number} занята")
+
     def nativeEventFilter(self, event_type, message):
-        if self.registered and bytes(event_type) == b"windows_dispatcher_MSG":
+        if bytes(event_type) == b"windows_dispatcher_MSG":
             event = wintypes.MSG.from_address(int(message))
-            if event.message == 0x0312 and event.wParam == self.key_id:
-                self.controller.stop()
-                return True, 0
+            if event.message == 0x0312:
+                if self.registered and event.wParam == self.key_id:
+                    self.controller.stop()
+                    return True, 0
+                callback = self.studio_keys.get(event.wParam)
+                if callback:
+                    callback()
+                    return True, 0
         return False, 0
 
     def unregister(self):
@@ -46,4 +61,7 @@ class EmergencyHotkey(QAbstractNativeEventFilter):
 
     def close(self):
         self.unregister()
+        for number in self.studio_keys:
+            self.user.UnregisterHotKey(None, number)
+        self.studio_keys.clear()
         self.app.removeNativeEventFilter(self)
