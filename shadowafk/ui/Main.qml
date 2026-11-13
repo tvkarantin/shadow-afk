@@ -17,11 +17,11 @@ ApplicationWindow {
     property bool trayAvailable: false
     property int page: 0
     property var session: backend.status
-    property var pages: ["Обзор", "Мониторинг", "Награды", "Шаблоны", "Статистика", "Настройки", "Журнал"]
+    property var pages: ["Обзор", "Мониторинг", "Награды", "Шаблоны", "Статистика", "Настройки", "Журнал", "Telegram"]
     property var subtitles: ["Контроль циклов, прогресса и состояния сессии",
         "Видимый кадр и подтверждённое состояние", "Ручной учёт прогресса заданий",
-        "Образцы экранов и кнопок", "История сессий и экспорт", "Параметры наблюдения и симуляции", "События приложения"]
-    property var icons: ["▦", "◎", "◈", "▧", "▥", "⚙", "≡"]
+        "Образцы экранов и кнопок", "История сессий и экспорт", "Параметры наблюдения и симуляции", "События приложения", "Персональные уведомления"]
+    property var icons: ["▦", "◎", "◈", "▧", "▥", "⚙", "≡", "↗"]
     property var screenshot: ""
     property var beforeImage: ""
     property var afterImage: ""
@@ -550,7 +550,7 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             spacing: 9
                             Action { text: "+ Открыть изображение"; primary: true; onClicked: templateFile.open() }
-                            ComboBox { id: templateState; model: backend.stages; textRole: "title"; valueRole: "key" }
+                            ComboBox { id: templateState; model: backend.stages.concat([{key: "VICTORY", title: "Королевская победа"}]); textRole: "title"; valueRole: "key" }
                             SpinBox { id: referenceWidth; from: 6; to: 16000; value: 1920; editable: true }
                             Action {
                                 text: "Сохранить шаблон"
@@ -707,6 +707,57 @@ ApplicationWindow {
                         Repeater {
                             model: backend.logs
                             LogRow { required property var modelData; event: modelData }
+                        }
+                    }
+                    Card {
+                        visible: root.page === 7
+                        id: telegramCard
+                        property var connection: telegram.status
+                        Heading { text: "Telegram" }
+                        Caption {
+                            Layout.fillWidth: true
+                            text: !telegramCard.connection.configured ? "Сервис Telegram пока не настроен"
+                                : telegramCard.connection.state === "connected" ? "Подключён · " + telegramCard.connection.name
+                                : telegramCard.connection.state === "pending" ? "Нажмите Start в открывшемся боте"
+                                : "Не подключён"
+                        }
+                        Caption { Layout.fillWidth: true; visible: !!telegramCard.connection.error; text: telegramCard.connection.error; color: "#fa7c84" }
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 9
+                            Action {
+                                text: "Привязать Telegram"; primary: true
+                                visible: telegramCard.connection.configured && telegramCard.connection.state === "disconnected"
+                                enabled: !telegramCard.connection.busy
+                                onClicked: telegram.begin()
+                            }
+                            Action {
+                                text: "Открыть Telegram"; visible: telegramCard.connection.state === "pending"
+                                enabled: !telegramCard.connection.busy; onClicked: telegram.openTelegram()
+                            }
+                            Action {
+                                text: "Отменить"; visible: telegramCard.connection.state === "pending"
+                                enabled: !telegramCard.connection.busy; onClicked: telegram.cancel()
+                            }
+                            Action {
+                                text: "Отправить тестовое уведомление"; visible: telegramCard.connection.state === "connected"
+                                enabled: !telegramCard.connection.busy; onClicked: telegram.testNotice()
+                            }
+                            Action {
+                                text: "Отвязать Telegram"; danger: true; visible: telegramCard.connection.state === "connected"
+                                enabled: !telegramCard.connection.busy; onClicked: telegram.unlink()
+                            }
+                        }
+                        Repeater {
+                            model: telegramCard.connection.state === "connected" ? telegramCard.connection.events : []
+                            CheckBox {
+                                required property var modelData
+                                text: modelData.label
+                                checked: modelData.enabled
+                                enabled: !telegramCard.connection.busy
+                                palette.windowText: "#f2f5fc"
+                                onClicked: telegram.preference(modelData.key, checked)
+                            }
                         }
                     }
                     Item { implicitHeight: 22 }

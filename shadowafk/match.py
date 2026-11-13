@@ -17,8 +17,9 @@ STAGES = [
     ("RETURNING_TO_LOBBY", "Возврат в лобби", "Цикл завершается"),
 ]
 LABELS = {key: (title, hint) for key, title, hint in STAGES}
+LABELS["VICTORY"] = ("Королевская победа", "Шаблон баннера победы")
 TRANSITIONS = {
-    "UNKNOWN": set(LABELS),
+    "UNKNOWN": set(LABELS) - {"VICTORY"},
     "LOBBY": {"MATCHMAKING", "LOADING", "WAITING_FOR_PLAYERS", "BATTLE_BUS", "IN_MATCH"},
     "MATCHMAKING": {"LOBBY", "LOADING", "WAITING_FOR_PLAYERS", "BATTLE_BUS", "IN_MATCH"},
     "LOADING": {"LOBBY", "WAITING_FOR_PLAYERS", "BATTLE_BUS", "IN_MATCH"},
@@ -155,6 +156,8 @@ def detect(frame, templates, threshold, state_thresholds=None, current="", cance
         return Detection(reason="Нет пригодных шаблонов для кадра")
     state, (score, box, name) = ranked[0]
     minimum = (state_thresholds or {}).get(state, threshold)
+    if state == "VICTORY":
+        minimum = max(0.95, minimum)
     minimum = max(0.5, minimum - 0.02) if state == current else minimum
     reason = ""
     if score < minimum:

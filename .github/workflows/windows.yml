@@ -30,6 +30,20 @@ jobs:
           }
           if (!(Test-Path $compiler)) { throw "Inno Setup compiler not found" }
           "ISCC=$compiler" >> $env:GITHUB_ENV
+      - name: Configure public Telegram endpoint
+        shell: pwsh
+        env:
+          SHADOW_SUPABASE_URL: ${{ vars.SHADOW_SUPABASE_URL }}
+          SHADOW_SUPABASE_KEY: ${{ vars.SHADOW_SUPABASE_PUBLISHABLE_KEY }}
+        run: |
+          if ($env:SHADOW_SUPABASE_URL -or $env:SHADOW_SUPABASE_KEY) {
+            if ($env:SHADOW_SUPABASE_URL -notmatch '^https://[a-z0-9]+\.supabase\.co/?$' -or
+                $env:SHADOW_SUPABASE_KEY -notmatch '^sb_publishable_[a-zA-Z0-9_-]+$') {
+              throw "Expected hosted Supabase URL and a publishable key"
+            }
+            @{url=$env:SHADOW_SUPABASE_URL; publishable_key=$env:SHADOW_SUPABASE_KEY} |
+              ConvertTo-Json | Set-Content shadowafk/ui/telegram-config.json -Encoding utf8
+          }
       - name: Build and test
         shell: cmd
         run: build.bat

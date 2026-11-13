@@ -7,6 +7,7 @@ from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
 from time import monotonic
+from uuid import uuid4
 from threading import Event
 
 import cv2
@@ -16,6 +17,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickImageProvider
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
+from shadowafk.telegram import Telegram
 from shadowafk.capture import CaptureState, capture, windows
 from shadowafk.hotkey import EmergencyHotkey, STOP_KEYS
 from shadowafk.match import LABELS, STAGES, TRANSITIONS, Detection, Match, Pattern, detect, load_gray
@@ -92,6 +94,11 @@ class Controller(QObject):
         self.hotkey = None
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.future = None
+        self.telegram = None
+        self.notification_session = ""
+        self.window_closed_since = None
+        self.recognition_misses = 0
+        self.victory_frames = 0
         self.generation = 0
         self.cancelled = Event()
         self.capture_state = CaptureState.NO_FRAME
@@ -312,6 +319,10 @@ class Controller(QObject):
             if self.missingCritical:
                 self.notify.emit("Нет шаблонов: " + self.missingCritical)
         self.mode = mode
+        self.notification_session = uuid4().hex
+        self.window_closed_since = None
+        self.recognition_misses = 0
+        self.victory_frames = 0
         self.match = Match(state="UNKNOWN" if mode == "live" else "LOBBY")
         self.stage = -1
         self.elapsed = self.errors = self.confidence = 0
@@ -338,6 +349,7 @@ class Controller(QObject):
         self.tick()
 
     def cancel_pending(self):
+        self.victory_frames = 0
         self.generation += 1
         self.cancelled.set()
         if self.future is not None:
@@ -375,6 +387,9 @@ class Controller(QObject):
             return
         self.cancel_pending()
         self.checkpoint(result)
+        if self.telegram and self.mode == "live":
+            self.telegram.notice("summary", self.notification_session, games=self.match.detected,
+                                 completed=self.match.completed, seconds=int(self.active_time()))
         self.match.interrupt(self.active_time())
         self.match.started = self.match.match_id = None
         self.elapsed = self.active_time()
@@ -409,8 +424,19 @@ class Controller(QObject):
                 ):
                     self.errors += 1
                     self.log("Ошибка захвата: " + (error_text or "кадр недоступен"))
+                    if self.telegram and self.mode == "live":
+                        self.telegram.notice("app_error", self.notification_session)
                 self.capture_state, self.capture_error = capture_status, error_text
+                if capture_status == CaptureState.WINDOW_CLOSED and self.match.match_id:
+                    if self.window_closed_since is None:
+                        self.window_closed_since = monotonic()
+                    elif monotonic() - self.window_closed_since >= 8 and self.telegram:
+                        self.telegram.notice("fortnite_exit", f"{self.notification_session}:{self.match.match_id}")
+                        self.window_closed_since = float("inf")
+                else:
+                    self.window_closed_since = None
                 if frame is None:
+                    self.recognition_misses = self.victory_frames = 0
                     self.match.interrupt(self.active_time())
                     if capture_status == CaptureState.WINDOW_CLOSED:
                         available = windows()
@@ -423,10 +449,26 @@ class Controller(QObject):
                     self.preview_revision += 1
                     self.last_frame = monotonic()
                     state = self.detection.state
+                    if state == "VICTORY":
+                        if self.mode == "live" and self.match.match_id:
+                            self.victory_frames += 1
+                            if self.victory_frames == 3:
+                                if self.telegram:
+                                    self.telegram.notice("victory", f"{self.notification_session}:{self.match.match_id}")
+                                self.observe("RESULTS", 1)
+                        state = ""
+                    else:
+                        self.victory_frames = 0
                     if self.detection.candidate:
                         self.state_scores[self.detection.candidate] = f"{self.confidence:.0%}"
                     if state and state != self.match.state and state not in TRANSITIONS[self.match.state]:
                         self.detection = replace(self.detection, reason="Переход из текущего состояния не подтверждён")
+                    if self.detection.reason and self.detection.candidate:
+                        self.recognition_misses += 1
+                        if self.recognition_misses == 12 and self.telegram:
+                            self.telegram.notice("recognition", self.notification_session)
+                    else:
+                        self.recognition_misses = 0
                     self.observe(state, 3)
                     if state and state == self.match.state:
                         self.last_detected[state] = datetime.now().strftime("%H:%M:%S")
@@ -526,7 +568,7 @@ class Controller(QObject):
 
     @Slot(QUrl, str, int, int, int, int, int)
     def importTemplate(self, source, state, reference_width, x, y, w, h):
-        if state not in {item[0] for item in STAGES}:
+        if state not in LABELS:
             return
         try:
             frame = load_gray(source.toLocalFile())
@@ -598,6 +640,8 @@ class Controller(QObject):
             self.hotkey.close()
         self.timer.stop()
         self.stop("Закрыто")
+        if self.telegram:
+            self.telegram.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.db.close()
 
@@ -617,7 +661,10 @@ def main():
         temporary = TemporaryDirectory()
         directory = Path(temporary.name)
     controller = Controller(directory)
+    telegram = Telegram(directory, offline=smoke)
+    controller.telegram = telegram
     engine = QQmlApplicationEngine()
+    engine.rootContext().setContextProperty("telegram", telegram)
     engine.addImageProvider("capture", controller.preview)
     engine.rootContext().setContextProperty("backend", controller)
     engine.load(QUrl.fromLocalFile(str(ui / "Main.qml")))
@@ -626,7 +673,7 @@ def main():
         return 1
     window = engine.rootObjects()[0]
     if smoke:
-        for page in range(1, 7):
+        for page in range(1, 8):
             window.setProperty("page", page)
             app.processEvents()
         window.setProperty("page", 0)

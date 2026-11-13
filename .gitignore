@@ -8,3 +8,9 @@ release/
 .DS_Store
 
 /ShadowAFK.spec
+
+/shadowafk/ui/telegram-config.json
+/supabase/.temp/
+/supabase/.branches/
+.env
+.env.*
