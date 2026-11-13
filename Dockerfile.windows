@@ -1,0 +1,15 @@
+FROM --platform=linux/amd64 debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive WINEDEBUG=-all WINEPREFIX=/opt/wine WINEDLLOVERRIDES="mscoree,mshtml;winedbg="
+RUN dpkg --add-architecture i386 \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends wine wine64 wine32:i386 xvfb xauth unzip ca-certificates curl zip fonts-liberation \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -fSL --retry 3 https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip -o /tmp/python.zip \
+ && mkdir -p /opt/python \
+ && unzip -q /tmp/python.zip -d /opt/python \
+ && rm /tmp/python.zip /opt/python/python312._pth \
+ && curl -fSL --retry 3 https://bootstrap.pypa.io/get-pip.py -o /opt/python/get-pip.py \
+ && curl -fSL --retry 3 https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe -o /tmp/inno.exe \
+ && timeout 240 xvfb-run -a sh -ec 'wineboot --init; wine /opt/python/python.exe Z:\\opt\\python\\get-pip.py --no-warn-script-location; wine /tmp/inno.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-; wineserver -w' \
+ && rm /tmp/inno.exe /opt/python/get-pip.py
+WORKDIR /workspace

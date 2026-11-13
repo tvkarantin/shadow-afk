@@ -1,0 +1,10 @@
+.venv/
+.bootstrap/
+__pycache__/
+.pytest_cache/
+build/
+dist/
+release/
+.DS_Store
+
+/ShadowAFK.spec
