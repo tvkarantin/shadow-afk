@@ -42,7 +42,7 @@ ApplicationWindow {
         else Qt.quit()
     }
     Shortcut { sequence: "Ctrl+B"; onActivated: backend.pause() }
-    Shortcut { sequence: root.stopKey; onActivated: backend.stop() }
+    Shortcut { sequence: root.stopKey; enabled: !backend.globalStop; onActivated: backend.stop() }
     Shortcut { sequence: "W"; enabled: preview.activeFocus; onActivated: backend.simulateKey("W") }
     Shortcut { sequence: "A"; enabled: preview.activeFocus; onActivated: backend.simulateKey("A") }
     Shortcut { sequence: "S"; enabled: preview.activeFocus; onActivated: backend.simulateKey("S") }
@@ -394,6 +394,12 @@ ApplicationWindow {
                     Card {
                         visible: root.page === 1
                         Heading { text: "Визуальный монитор" }
+                        Caption {
+                            Layout.fillWidth: true
+                            visible: !!backend.missingCritical
+                            color: "#ffd17a"
+                            text: "Отсутствуют шаблоны: " + backend.missingCritical
+                        }
                         RowLayout {
                             Layout.fillWidth: true
                             ComboBox {
@@ -441,6 +447,31 @@ ApplicationWindow {
                         }
                         Caption {
                             Layout.fillWidth: true
+                            visible: root.session.mode === "live"
+                            text: "Захват: " + root.session.capture + "   ·   Возраст кадра: "
+                                + (root.session.frameAge < 0 ? "—" : root.session.frameAge + " с")
+                                + "\nПредыдущее состояние: " + root.session.previous
+                                + "   ·   Матч: " + (root.session.matchId || "—")
+                                + "   ·   Подтверждения: " + root.session.confirmations
+                                + "\nКандидат: " + (root.session.candidate || "—") + "   ·   Шаблон: " + (root.session.template || "—")
+                                + "\n" + [root.session.reason, root.session.captureError].filter(Boolean).join(" · ")
+                        }
+                        Action {
+                            text: "Сохранить кадр"
+                            enabled: !!root.session.preview
+                            onClicked: diagnosticFile.open()
+                        }
+                        Repeater {
+                            model: backend.diagnostics
+                            Caption {
+                                required property var modelData
+                                Layout.fillWidth: true
+                                text: modelData.title + " · " + (modelData.count ? "Шаблонов: " + modelData.count : "Нет шаблонов")
+                                    + " · " + modelData.confidence + " · Последнее обнаружение: " + modelData.last
+                            }
+                        }
+                        Caption {
+                            Layout.fillWidth: true
                             text: backend.windowsSupported
                                 ? "Для захвата используйте оконный режим без рамки. Кадры поступают, пока Fortnite на переднем плане."
                                 : "На macOS доступны симулятор, цели, шаблоны и статистика."
@@ -472,6 +503,25 @@ ApplicationWindow {
                                     Action { text: "−1"; onClicked: backend.updateGoal(modelData.id, modelData.progress - 1) }
                                     Action { text: "+1"; onClicked: backend.updateGoal(modelData.id, modelData.progress + 1) }
                                     Action { text: "Удалить"; danger: true; onClicked: backend.removeGoal(modelData.id) }
+                                }
+                                RowLayout {
+                                    Caption { text: "За матч: " + modelData.perMatch + " · За час: " + modelData.perHour }
+                                    SpinBox { id: proposed; from: 0; to: 1000000; value: modelData.pending >= 0 ? modelData.pending : modelData.progress; editable: true }
+                                    Action { text: "Записать как черновик"; onClicked: backend.proposeGoal(modelData.id, proposed.value) }
+                                    Action {
+                                        visible: modelData.pending >= 0
+                                        text: "Подтвердить " + modelData.pending
+                                        onClicked: backend.updateGoal(modelData.id, modelData.pending)
+                                    }
+                                }
+                                Repeater {
+                                    model: modelData.events
+                                    Caption {
+                                        required property var modelData
+                                        text: modelData.date.replace("T", " ") + " · " + modelData.before + " → " + modelData.after
+                                            + (modelData.confirmed ? "" : " · Не подтверждено")
+                                            + (modelData.session_id ? " · Сессия " + modelData.session_id : "")
+                                    }
                                 }
                                 Meter { value: Math.min(1, modelData.progress / modelData.target) }
                             }
@@ -554,6 +604,17 @@ ApplicationWindow {
                                 }
                             }
                         }
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 9
+                            SpinBox { id: stateThreshold; from: 50; to: 99; value: backend.settings.threshold; editable: true }
+                            Field { id: roi; width: 230; placeholderText: "ROI: слева, сверху, справа, снизу" }
+                            Action {
+                                text: "Порог и ROI выбранного состояния"
+                                enabled: !root.session.active
+                                onClicked: backend.setStateOptions(templateState.currentValue, stateThreshold.value, roi.text)
+                            }
+                        }
                         Repeater {
                             model: backend.templates
                             RowLayout {
@@ -617,7 +678,7 @@ ApplicationWindow {
                             Caption { text: (threshold.value / 100).toFixed(2) }
                         }
                         CheckBox { id: repeat; text: "Повторять тестовые циклы"; checked: backend.settings.repeat; palette.windowText: "#f2f5fc" }
-                        Heading { text: "Горячие клавиши в окне" }
+                        Heading { text: "Горячие клавиши" }
                         Caption { text: "Ctrl+B   ·   Пауза / продолжить" }
                         RowLayout {
                             Caption { text: "Стоп" }
@@ -655,6 +716,14 @@ ApplicationWindow {
     }
 
     Component.onCompleted: root.stopKey = backend.settings.stopKey
+    FileDialog {
+        id: diagnosticFile
+        title: "Сохранить диагностический кадр"
+        fileMode: FileDialog.SaveFile
+        defaultSuffix: "png"
+        nameFilters: ["PNG (*.png)"]
+        onAccepted: backend.saveDiagnostic(selectedFile)
+    }
     FileDialog {
         id: templateFile
         title: "Открыть шаблон"

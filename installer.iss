@@ -1,7 +1,7 @@
 [Setup]
 AppId={{38F27F47-D6F6-4B2A-BFD4-2C562C513283}
 AppName=Shadow AFK
-AppVersion=0.1.0
+AppVersion=0.1.1
 DefaultDirName={localappdata}\Programs\Shadow AFK
 DefaultGroupName=Shadow AFK
 DisableDirPage=no

@@ -17,11 +17,8 @@ STAGES = [
     ("RETURNING_TO_LOBBY", "Возврат в лобби", "Цикл завершается"),
 ]
 LABELS = {key: (title, hint) for key, title, hint in STAGES}
-LABELS.update(GAME_NOT_FOUND=("Игра не найдена", "Выберите окно Fortnite"),
-              ERROR=("Захват недоступен", "Проверьте, что окно игры открыто"))
 TRANSITIONS = {
-    "GAME_NOT_FOUND": set(LABELS) - {"ERROR"},
-    "ERROR": set(LABELS),
+    "UNKNOWN": set(LABELS),
     "LOBBY": {"MATCHMAKING", "LOADING", "WAITING_FOR_PLAYERS", "BATTLE_BUS", "IN_MATCH"},
     "MATCHMAKING": {"LOBBY", "LOADING", "WAITING_FOR_PLAYERS", "BATTLE_BUS", "IN_MATCH"},
     "LOADING": {"LOBBY", "WAITING_FOR_PLAYERS", "BATTLE_BUS", "IN_MATCH"},
@@ -37,7 +34,11 @@ TRANSITIONS = {
 
 @dataclass
 class Match:
-    state: str = "GAME_NOT_FOUND"
+    state: str = "UNKNOWN"
+    previous: str = "UNKNOWN"
+    match_id: int | None = None
+    spectating_since: float | None = None
+    last_confirmed: int = 0
     pending: str = ""
     confirmations: int = 0
     started: float | None = None
@@ -48,7 +49,7 @@ class Match:
     changed_at: float = 0
 
     def observe(self, candidate, now, required=3):
-        allowed = TRANSITIONS[self.state] | {"GAME_NOT_FOUND", "ERROR"}
+        allowed = TRANSITIONS[self.state]
         if not candidate or candidate == self.state or candidate not in allowed:
             self.pending, self.confirmations = "", 0
             return False
@@ -57,20 +58,56 @@ class Match:
         self.confirmations += 1
         if self.confirmations < required:
             return False
-        if self.state == "SPECTATING":
-            self.spectating_seconds += now - self.changed_at
+        self.suspend_spectating(now)
+        self.previous = self.state
         self.state, self.changed_at = candidate, now
+        self.last_confirmed = self.confirmations
+        if candidate == "SPECTATING":
+            self.spectating_since = now
         self.pending, self.confirmations = "", 0
         if candidate in {"BATTLE_BUS", "IN_MATCH", "ELIMINATED", "SPECTATING"} and self.started is None:
             self.started = now
             self.detected += 1
+            self.match_id = self.detected
         if candidate == "RESULTS" and self.started is not None:
             self.match_seconds += now - self.started
             self.completed += 1
             self.started = None
-        if candidate in {"LOBBY", "GAME_NOT_FOUND", "ERROR"}:
-            self.started = None
+        if candidate in {"RESULTS", "LOBBY"}:
+            self.started = self.match_id = None
         return True
+
+
+    def suspend_spectating(self, now):
+        if self.spectating_since is not None:
+            self.spectating_seconds += now - self.spectating_since
+            self.spectating_since = None
+
+    def interrupt(self, now):
+        self.pending, self.confirmations = "", 0
+        self.suspend_spectating(now)
+
+    def spectating_total(self, now):
+        return self.spectating_seconds + (now - self.spectating_since if self.spectating_since is not None else 0)
+
+
+@dataclass(frozen=True)
+class Pattern:
+    state: str
+    image: np.ndarray
+    reference_width: int
+    name: str = ""
+    roi: tuple | None = None
+
+
+@dataclass(frozen=True)
+class Detection:
+    state: str = ""
+    confidence: float = 0
+    box: tuple | None = None
+    candidate: str = ""
+    template: str = ""
+    reason: str = ""
 
 
 def load_gray(path):
@@ -81,27 +118,47 @@ def load_gray(path):
 
 
 def recognize(frame, templates, threshold):
+    result = detect(frame, [Pattern(*item) for item in templates], threshold)
+    return result.state, result.confidence, result.box if result.state else None
+
+
+def detect(frame, templates, threshold, state_thresholds=None, current="", cancelled=None):
     height, width = frame.shape
     factor = min(1.0, 960 / width)
     if factor < 1:
         frame = cv2.resize(frame, (round(width * factor), round(height * factor)), interpolation=cv2.INTER_AREA)
     scores = {}
-    for state, pattern, reference_width in templates:
+    for item in templates:
+        if cancelled is not None and cancelled.is_set():
+            return Detection(reason="Отменено")
+        state, pattern, reference_width = item.state, item.image, item.reference_width
+        if pattern.ndim != 2 or not pattern.size or reference_width <= 0:
+            continue
+        fh, fw = frame.shape
+        left, top, right, bottom = item.roi or (0, 0, 1, 1)
+        x0, y0 = round(left * fw), round(top * fh)
+        area = frame[y0:round(bottom * fh), x0:round(right * fw)]
         for adjustment in (0.9, 1.0, 1.1):
             scale = width / reference_width * adjustment * factor
             w, h = (round(size * scale) for size in reversed(pattern.shape))
-            if min(w, h) < 6 or w > frame.shape[1] or h > frame.shape[0]:
+            if min(w, h) < 6 or w > area.shape[1] or h > area.shape[0]:
                 continue
             sample = cv2.resize(pattern, (w, h), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
             if sample.std() < 2:
                 continue
-            _, score, _, (x, y) = cv2.minMaxLoc(cv2.matchTemplate(frame, sample, cv2.TM_CCOEFF_NORMED))
+            _, score, _, (x, y) = cv2.minMaxLoc(cv2.matchTemplate(area, sample, cv2.TM_CCOEFF_NORMED))
             if score > scores.get(state, (-1, None))[0]:
-                scores[state] = (score, tuple(round(v / factor) for v in (x, y, w, h)))
-    ranked = sorted(((score, state, box) for state, (score, box) in scores.items()), reverse=True)
+                box = tuple(round(v / factor) for v in (x + x0, y + y0, w, h))
+                scores[state] = (score, box, item.name)
+    ranked = sorted(scores.items(), key=lambda item: item[1][0], reverse=True)
     if not ranked:
-        return "", 0, None
-    score, state, box = ranked[0]
-    if score < threshold or (len(ranked) > 1 and score - ranked[1][0] < 0.03):
-        return "", max(0, score), None
-    return state, score, box
+        return Detection(reason="Нет пригодных шаблонов для кадра")
+    state, (score, box, name) = ranked[0]
+    minimum = (state_thresholds or {}).get(state, threshold)
+    minimum -= 0.02 if state == current else 0
+    reason = ""
+    if score < minimum:
+        reason = "Совпадение ниже порога"
+    elif len(ranked) > 1 and score - ranked[1][1][0] < (0.05 if current and state != current else 0.03):
+        reason = "Неоднозначное совпадение"
+    return Detection(state if not reason else "", max(0, score), box, state, name, reason)

@@ -4,8 +4,10 @@ import sqlite3
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 from time import monotonic
+from threading import Event
 
 import cv2
 from PySide6.QtCore import QObject, Property, QStandardPaths, Qt, QTimer, QUrl, Signal, Slot
@@ -14,23 +16,25 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickImageProvider
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-from shadowafk.capture import capture, windows
-from shadowafk.match import LABELS, STAGES, Match, load_gray, recognize
+from shadowafk.capture import CaptureState, capture, windows
+from shadowafk.hotkey import EmergencyHotkey, STOP_KEYS
+from shadowafk.match import LABELS, STAGES, TRANSITIONS, Detection, Match, Pattern, detect, load_gray
 
 
-def process_frame(window, templates, threshold):
-    error, frame = capture(window["handle"], window["pid"])
+def process_frame(window, templates, threshold, thresholds=None, current='', cancelled=None):
+    status, frame = capture(window["handle"], window["pid"])
     if frame is None:
-        return error, 0, None
-    state, confidence, box = recognize(frame, templates, threshold)
-    if box:
-        x, y, w, h = box
+        return status, Detection(), None
+    result = detect(frame, templates, threshold, thresholds, current, cancelled)
+    if result.box:
+        frame = frame.copy()
+        x, y, w, h = result.box
         cv2.rectangle(frame, (x, y), (x+w, y+h), 255, max(2, frame.shape[1] // 500))
     if frame.shape[1] > 800:
         frame = cv2.resize(frame, (800, round(frame.shape[0] * 800 / frame.shape[1])))
     height, width = frame.shape
     preview = QImage(frame.tobytes(), width, height, width, QImage.Format_Grayscale8)
-    return state, confidence, preview.copy()
+    return status, result, preview.copy()
 
 
 class PreviewProvider(QQuickImageProvider):
@@ -64,12 +68,15 @@ class Controller(QObject):
                 spectating_seconds REAL, errors INTEGER, result TEXT);
             CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY, time TEXT, message TEXT);
             CREATE TABLE IF NOT EXISTS goals(id INTEGER PRIMARY KEY, name TEXT, progress INTEGER, target INTEGER);
+            CREATE TABLE IF NOT EXISTS goal_events(id INTEGER PRIMARY KEY, goal_id INTEGER,
+                session_id INTEGER, date TEXT, before INTEGER, after INTEGER, confirmed INTEGER);
             CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY, name TEXT, state TEXT,
                 reference_width INTEGER, path TEXT);
             UPDATE sessions SET result='Прервано' WHERE result='Активна';
         """)
         self.settings_path = directory / "settings.json"
         self.config = {"speed": 3, "threshold": 85, "repeat": True, "stopKey": "Ctrl+Alt+Q"}
+        saved = {}
         try:
             saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
             self.config.update(speed=max(1, min(5, int(saved["speed"]))),
@@ -77,9 +84,23 @@ class Controller(QObject):
                                repeat=bool(saved["repeat"]), stopKey=saved.get("stopKey", "Ctrl+Alt+Q"))
         except (OSError, ValueError, KeyError, TypeError):
             pass
+        self.config["stateOptions"] = saved.get("stateOptions", {}) if isinstance(saved, dict) else {}
+        if not isinstance(self.config["stateOptions"], dict):
+            self.config["stateOptions"] = {}
+        if self.config["stopKey"] not in tuple(STOP_KEYS):
+            self.config["stopKey"] = "Ctrl+Alt+Q"
+        self.hotkey = None
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.future = None
         self.generation = 0
+        self.cancelled = Event()
+        self.capture_state = CaptureState.NO_FRAME
+        self.detection = Detection()
+        self.capture_error = ""
+        self.last_frame = None
+        self.last_detected = {}
+        self.state_scores = {}
+        self.template_counts = {}
         self.session = None
         self.mode = "sim"
         self.match = Match()
@@ -100,6 +121,7 @@ class Controller(QObject):
         self.action = ""
         self.timer = QTimer(self, interval=200)
         self.timer.timeout.connect(self.tick)
+        self.template_counts = self.count_templates(self.templates)
         self.timer.start()
 
     def rows(self, sql):
@@ -113,11 +135,17 @@ class Controller(QObject):
             title, hint = self.outcome, "Запустите симуляцию или мониторинг"
         elif self.paused:
             title, hint = "На паузе", "Продолжите, когда будете готовы"
-        elif self.mode == "live" and not self.preview_visible and self.match.state not in {"ERROR", "GAME_NOT_FOUND"}:
+        elif self.mode == "live" and self.capture_state != CaptureState.FRAME_AVAILABLE:
             hint = "Ожидание видимого кадра Fortnite"
         return dict(active=active, paused=self.paused, title=title, hint=hint, games=self.match.detected,
                     cycles=self.match.completed, seconds=int(self.active_time()), stage=self.stage,
                     mode=self.mode, state=self.match.state, confidence=self.confidence, action=self.action,
+                    capture=str(self.capture_state), previous=self.match.previous,
+                    matchId=str(self.match.match_id or ""), candidate=self.detection.candidate,
+                    template=self.detection.template, reason=self.detection.reason,
+                    captureError=self.capture_error,
+                    confirmations=self.match.confirmations or self.match.last_confirmed,
+                    frameAge=-1 if self.last_frame is None else round(monotonic() - self.last_frame, 1),
                     preview=f"image://capture/{self.preview_revision}" if self.preview_visible else "")
 
     @Property("QVariantList", constant=True)
@@ -137,6 +165,20 @@ class Controller(QObject):
         rows = self.rows("SELECT * FROM goals ORDER BY id DESC")
         for row in rows:
             row["delta"] = row["progress"] - self.baseline.get(row["id"], row["progress"])
+            events = list(self.db.execute(
+                "SELECT * FROM goal_events WHERE goal_id=? ORDER BY id DESC LIMIT 10", (row["id"],)))
+            row["events"] = [dict(event) for event in events]
+            row["pending"] = next((event["after"] for event in events if not event["confirmed"]), -1)
+            totals = self.db.execute("""
+                SELECT COALESCE(SUM(changes.delta), 0), COALESCE(SUM(s.cycles), 0),
+                       COALESCE(SUM(s.seconds), 0)
+                FROM (SELECT session_id, SUM(after-before) AS delta FROM goal_events
+                      WHERE goal_id=? AND confirmed=1 GROUP BY session_id) AS changes
+                JOIN sessions s ON s.id=changes.session_id WHERE s.mode='live'
+            """, (row["id"],)).fetchone()
+            delta, matches, seconds = totals
+            row["perMatch"] = f"{delta / matches:.2f}" if matches else "—"
+            row["perHour"] = f"{delta * 3600 / seconds:.2f}" if seconds else "—"
         return rows
 
     @Property("QVariantList", notify=libraryChanged)
@@ -153,6 +195,39 @@ class Controller(QObject):
                              url=QUrl.fromLocalFile(str(path)).toString(), builtin=True))
         return rows
 
+    @Property(str, notify=changed)
+    def missingCritical(self):
+        return ", ".join(LABELS[state][0] for state in ("LOBBY", "IN_MATCH", "RESULTS")
+                         if not self.template_counts.get(state))
+
+    @Property("QVariantList", notify=changed)
+    def diagnostics(self):
+        return [dict(state=key, title=title, count=self.template_counts.get(key, 0),
+                     last=self.last_detected.get(key, "—"), confidence=self.state_scores.get(key, "—"))
+                for key, title, _ in STAGES]
+
+    @Slot(QUrl)
+    def saveDiagnostic(self, target):
+        if self.preview.frame.isNull() or not self.preview.frame.save(target.toLocalFile(), "PNG"):
+            self.notify.emit("Не удалось сохранить диагностический кадр")
+
+    @Slot(str, int, str)
+    def setStateOptions(self, state, threshold, roi_text):
+        try:
+            roi = tuple(float(value.strip()) for value in roi_text.split(",")) if roi_text.strip() else None
+            if state not in LABELS or not 0.50 <= threshold / 100 <= 0.99:
+                raise ValueError
+            if roi is not None:
+                x, y, right, bottom = roi
+                if not (0 <= x < right <= 1 and 0 <= y < bottom <= 1):
+                    raise ValueError
+        except (TypeError, ValueError):
+            self.notify.emit("ROI: четыре числа от 0 до 1 через запятую")
+            return
+        self.config["stateOptions"][state] = dict(threshold=threshold / 100, roi=roi)
+        self.saveSettings(self.config["speed"], self.config["threshold"], self.config["repeat"], self.config["stopKey"])
+        self.notify.emit("Настройки состояния сохранены")
+
     @Property("QVariantList", notify=changed)
     def windowTitles(self):
         return [row["title"] for row in self.window_list]
@@ -160,6 +235,10 @@ class Controller(QObject):
     @Property(bool, constant=True)
     def windowsSupported(self):
         return sys.platform == "win32"
+
+    @Property(bool, notify=settingsChanged)
+    def globalStop(self):
+        return self.hotkey is not None and self.hotkey.registered
 
     @Property("QVariantMap", notify=settingsChanged)
     def settings(self):
@@ -178,7 +257,16 @@ class Controller(QObject):
     @Slot()
     def refreshWindows(self):
         self.window_list = windows()
+        self.template_counts = self.count_templates(self.templates)
         self.changed.emit()
+
+    @staticmethod
+    def count_templates(templates):
+        counts = {}
+        for item in templates:
+            state = item["state"] if isinstance(item, dict) else item.state
+            counts[state] = counts.get(state, 0) + 1
+        return counts
 
     @Slot(str, int)
     def start(self, mode, index):
@@ -192,22 +280,52 @@ class Controller(QObject):
                 return
             self.window = self.window_list[index].copy()
             self.patterns = []
+            self.state_thresholds = {}
             for row in self.templates:
                 try:
-                    self.patterns.append((row["state"], load_gray(row["path"]), row["reference_width"]))
+                    state = row["state"]
+                    image = load_gray(row["path"])
+                    if min(image.shape) < 6 or image.std() < 2:
+                        raise ValueError("Недостаточный контраст или размер")
+                    options = self.config["stateOptions"].get(state, {})
+                    if not isinstance(options, dict):
+                        options = {}
+                    minimum = options.get("threshold", self.config["threshold"] / 100)
+                    roi = options.get("roi")
+                    if not isinstance(minimum, (int, float)) or not 0.5 <= minimum <= 0.99:
+                        minimum = self.config["threshold"] / 100
+                    if roi is not None and (
+                        not isinstance(roi, (list, tuple)) or len(roi) != 4
+                        or not all(isinstance(value, (int, float)) for value in roi)
+                        or not (0 <= roi[0] < roi[2] <= 1 and 0 <= roi[1] < roi[3] <= 1)
+                    ):
+                        roi = None
+                    if "threshold" in options:
+                        self.state_thresholds[state] = minimum
+                    self.patterns.append(Pattern(state, image, row["reference_width"], row["name"], roi))
                 except (OSError, ValueError, cv2.error):
                     self.log(f"Недоступен шаблон: {row['name']}")
             if not self.patterns:
                 self.notify.emit("Добавьте хотя бы один шаблон состояния")
                 return
+            self.template_counts = self.count_templates(self.patterns)
+            if self.missingCritical:
+                self.notify.emit("Нет шаблонов: " + self.missingCritical)
         self.mode = mode
-        self.match = Match(state="GAME_NOT_FOUND" if mode == "live" else "LOBBY")
+        self.match = Match(state="UNKNOWN" if mode == "live" else "LOBBY")
         self.stage = -1
         self.elapsed = self.errors = self.confidence = 0
         self.baseline = {row["id"]: row["progress"] for row in self.goals}
         self.action = ""
         self.preview_visible = False
-        self.generation += 1
+        self.preview.frame = QImage()
+        self.capture_state = CaptureState.NO_FRAME
+        self.detection = Detection()
+        self.capture_error = ""
+        self.last_frame = None
+        self.last_detected.clear()
+        self.state_scores.clear()
+        self.cancel_pending()
         self.clock = monotonic()
         self.next_step = self.clock
         self.last_checkpoint = -1
@@ -219,11 +337,18 @@ class Controller(QObject):
         self.log("Начата симуляция" if mode == "sim" else "Начато наблюдение за Fortnite")
         self.tick()
 
+    def cancel_pending(self):
+        self.generation += 1
+        self.cancelled.set()
+        if self.future is not None:
+            self.future.cancel()
+        self.cancelled = Event()
+
     @Slot()
     def pause(self):
         if self.session is None:
             return
-        self.generation += 1
+        self.cancel_pending()
         self.paused = not self.paused
         if self.paused:
             self.elapsed = self.active_time()
@@ -231,15 +356,13 @@ class Controller(QObject):
         else:
             self.clock = monotonic()
             self.next_step = self.clock
-        self.match.pending, self.match.confirmations = "", 0
+        self.match.interrupt(self.active_time())
         self.log("На паузе" if self.paused else "Сессия возобновлена")
         self.changed.emit()
 
     def checkpoint(self, result):
         now = self.active_time()
-        spectating = self.match.spectating_seconds
-        if self.match.state == "SPECTATING":
-            spectating += now - self.match.changed_at
+        spectating = self.match.spectating_total(now)
         with self.db:
             self.db.execute(
                 "UPDATE sessions SET games=?, cycles=?, seconds=?, match_seconds=?, spectating_seconds=?, errors=?, result=? WHERE id=?",
@@ -250,8 +373,10 @@ class Controller(QObject):
     def stop(self, result="Остановлено"):
         if self.session is None:
             return
-        self.generation += 1
+        self.cancel_pending()
         self.checkpoint(result)
+        self.match.interrupt(self.active_time())
+        self.match.started = self.match.match_id = None
         self.elapsed = self.active_time()
         self.clock = None
         self.session = None
@@ -263,8 +388,6 @@ class Controller(QObject):
     def observe(self, state, required):
         if self.match.observe(state, self.active_time(), required):
             self.stage = next((i for i, item in enumerate(STAGES) if item[0] == state), -1)
-            if state == "ERROR":
-                self.errors += 1
             self.log(LABELS[state][0])
             if state == "RESULTS" and self.mode == "live":
                 self.notify.emit("Матч завершён. Проверьте результаты в Fortnite.")
@@ -275,15 +398,40 @@ class Controller(QObject):
             self.future = None
             if generation == self.generation:
                 try:
-                    state, self.confidence, frame = job.result()
+                    capture_status, self.detection, frame = job.result()
+                    error_text = ""
                 except Exception as error:
-                    self.log(f"Ошибка захвата: {error}")
-                    state, self.confidence, frame = "ERROR", 0, None
-                self.preview_visible = frame is not None
-                if self.preview_visible:
+                    capture_status, self.detection, frame = CaptureState.CAPTURE_ERROR, Detection(), None
+                    error_text = str(error)
+                self.confidence = self.detection.confidence
+                if capture_status == CaptureState.CAPTURE_ERROR and (
+                    self.capture_state != capture_status or self.capture_error != error_text
+                ):
+                    self.errors += 1
+                    self.log("Ошибка захвата: " + (error_text or "кадр недоступен"))
+                self.capture_state, self.capture_error = capture_status, error_text
+                if frame is None:
+                    self.match.interrupt(self.active_time())
+                    if capture_status == CaptureState.WINDOW_CLOSED:
+                        available = windows()
+                        if len(available) == 1:
+                            self.window = available[0]
+                            self.log("Окно Fortnite найдено повторно")
+                else:
+                    self.preview_visible = True
                     self.preview.frame = frame
                     self.preview_revision += 1
-                self.observe(state, 3)
+                    self.last_frame = monotonic()
+                    state = self.detection.state
+                    if self.detection.candidate:
+                        self.state_scores[self.detection.candidate] = f"{self.confidence:.0%}"
+                    if state and state != self.match.state and state not in TRANSITIONS[self.match.state]:
+                        self.detection = replace(self.detection, reason="Переход из текущего состояния не подтверждён")
+                    self.observe(state, 3)
+                    if state and state == self.match.state:
+                        self.last_detected[state] = datetime.now().strftime("%H:%M:%S")
+                        if state == "SPECTATING" and self.match.spectating_since is None:
+                            self.match.spectating_since = self.active_time()
         if self.session is None or self.paused:
             return
         now = monotonic()
@@ -304,7 +452,8 @@ class Controller(QObject):
             elif self.future is None:
                 self.job_generation = self.generation
                 self.future = self.executor.submit(process_frame, self.window, self.patterns,
-                                                   self.config["threshold"] / 100)
+                                                   self.config["threshold"] / 100, self.state_thresholds,
+                                                   self.match.state, self.cancelled)
                 self.next_step = now + 0.65
         elapsed = int(self.active_time())
         if elapsed != self.last_checkpoint:
@@ -324,7 +473,12 @@ class Controller(QObject):
 
     @Slot(int, int, bool, str)
     def saveSettings(self, speed, threshold, repeat, stop_key):
-        self.config = dict(speed=speed, threshold=threshold, repeat=repeat, stopKey=stop_key)
+        if stop_key not in STOP_KEYS:
+            self.notify.emit("Недопустимая клавиша остановки")
+            return
+        if self.hotkey and stop_key != self.config["stopKey"]:
+            self.hotkey.register(stop_key)
+        self.config.update(speed=speed, threshold=threshold, repeat=repeat, stopKey=stop_key)
         temporary = self.settings_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.config), encoding="utf-8")
         temporary.replace(self.settings_path)
@@ -343,13 +497,30 @@ class Controller(QObject):
 
     @Slot(int, int)
     def updateGoal(self, key, value):
+        self.record_goal(key, value, True)
+
+    @Slot(int, int)
+    def proposeGoal(self, key, value):
+        self.record_goal(key, value, False)
+
+    def record_goal(self, key, value, confirmed):
+        row = self.db.execute("SELECT progress FROM goals WHERE id=?", (key,)).fetchone()
+        if row is None:
+            return
+        value = max(0, value)
         with self.db:
-            self.db.execute("UPDATE goals SET progress=? WHERE id=?", (max(0, value), key))
+            self.db.execute("DELETE FROM goal_events WHERE goal_id=? AND confirmed=0", (key,))
+            if confirmed:
+                self.db.execute("UPDATE goals SET progress=? WHERE id=?", (value, key))
+            self.db.execute(
+                "INSERT INTO goal_events(goal_id, session_id, date, before, after, confirmed) VALUES(?,?,?,?,?,?)",
+                (key, self.session, datetime.now().isoformat(timespec="seconds"), row["progress"], value, confirmed))
         self.libraryChanged.emit()
 
     @Slot(int)
     def removeGoal(self, key):
         with self.db:
+            self.db.execute("DELETE FROM goal_events WHERE goal_id=?", (key,))
             self.db.execute("DELETE FROM goals WHERE id=?", (key,))
         self.libraryChanged.emit()
 
@@ -377,6 +548,8 @@ class Controller(QObject):
         except (OSError, ValueError, cv2.error) as error:
             self.notify.emit(str(error))
             return
+        self.template_counts = self.count_templates(self.templates)
+        self.changed.emit()
         self.libraryChanged.emit()
         self.notify.emit("Шаблон сохранён")
 
@@ -387,6 +560,8 @@ class Controller(QObject):
             with self.db:
                 self.db.execute("DELETE FROM templates WHERE id=?", (key,))
             (self.directory / row["path"]).unlink(missing_ok=True)
+            self.template_counts = self.count_templates(self.templates)
+            self.changed.emit()
             self.libraryChanged.emit()
 
     @Slot(QUrl)
@@ -411,6 +586,7 @@ class Controller(QObject):
     def reset(self):
         if self.session is None:
             with self.db:
+                self.db.execute("UPDATE goal_events SET session_id=NULL")
                 self.db.execute("DELETE FROM sessions")
             self.match = Match()
             self.elapsed, self.stage = 0, -1
@@ -418,9 +594,11 @@ class Controller(QObject):
             self.changed.emit()
 
     def close(self):
+        if self.hotkey:
+            self.hotkey.close()
         self.timer.stop()
         self.stop("Закрыто")
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.executor.shutdown(wait=False, cancel_futures=True)
         self.db.close()
 
 
@@ -464,6 +642,10 @@ def main():
     if window.property("trayAvailable"):
         tray.show()
         controller.notify.connect(lambda message: tray.showMessage("Shadow AFK", message) if not window.isVisible() else None)
+    if sys.platform == "win32" and not smoke:
+        controller.hotkey = EmergencyHotkey(app, controller)
+        controller.hotkey.register(controller.settings["stopKey"])
+        controller.settingsChanged.emit()
     app.aboutToQuit.connect(controller.close)
     if smoke:
         QTimer.singleShot(350, app.quit)
