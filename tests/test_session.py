@@ -108,3 +108,52 @@ def test_goal_progress_requires_manual_confirmation(tmp_path):
         assert confirmed["perMatch"] == "—"
     finally:
         controller.close()
+
+
+def test_closed_window_reacquires_without_counting_a_new_match(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+    from PySide6.QtGui import QImage
+    from shadowafk import app as shadow_app
+
+    qt_app = QApplication.instance() or QApplication([])
+    controller = Controller(tmp_path)
+    old_window = {"handle": 10, "pid": 100, "title": "Fortnite"}
+    new_window = {"handle": 20, "pid": 200, "title": "Fortnite"}
+    monkeypatch.setattr(shadow_app, "windows", lambda: [new_window])
+
+    def accept_capture(status, state=""):
+        job = Future()
+        image = QImage(8, 8, QImage.Format_Grayscale8) if state else None
+        job.set_result((status, shadow_app.Detection(state, .95), image))
+        controller.future = job
+        controller.job_generation = controller.generation
+        controller.next_step = float("inf")
+        controller.tick()
+
+    try:
+        controller.window_list = [old_window]
+        with monkeypatch.context() as startup:
+            startup.setattr(controller, "tick", lambda: None)
+            controller.start("live", 0)
+        assert controller.session is not None
+        controller.observe("IN_MATCH", 1)
+        match_id = controller.match.match_id
+        for status in (shadow_app.CaptureState.WINDOW_NOT_ACTIVE, shadow_app.CaptureState.NO_FRAME,
+                       shadow_app.CaptureState.CAPTURE_ERROR, shadow_app.CaptureState.WINDOW_CLOSED):
+            accept_capture(status)
+            assert controller.match.state == "IN_MATCH"
+            assert controller.match.match_id == match_id
+        assert controller.window == new_window
+        for _ in range(3):
+            accept_capture(shadow_app.CaptureState.FRAME_AVAILABLE, "RESULTS")
+        assert controller.match.detected == controller.match.completed == 1
+        assert controller.errors == 1
+    finally:
+        controller.close()
+
+    reopened = Controller(tmp_path)
+    try:
+        row = reopened.history[0]
+        assert (row["mode"], row["games"], row["cycles"], row["result"]) == ("live", 1, 1, "Закрыто")
+    finally:
+        reopened.close()

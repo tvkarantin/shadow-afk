@@ -129,8 +129,6 @@ def detect(frame, templates, threshold, state_thresholds=None, current="", cance
         frame = cv2.resize(frame, (round(width * factor), round(height * factor)), interpolation=cv2.INTER_AREA)
     scores = {}
     for item in templates:
-        if cancelled is not None and cancelled.is_set():
-            return Detection(reason="Отменено")
         state, pattern, reference_width = item.state, item.image, item.reference_width
         if pattern.ndim != 2 or not pattern.size or reference_width <= 0:
             continue
@@ -139,6 +137,8 @@ def detect(frame, templates, threshold, state_thresholds=None, current="", cance
         x0, y0 = round(left * fw), round(top * fh)
         area = frame[y0:round(bottom * fh), x0:round(right * fw)]
         for adjustment in (0.9, 1.0, 1.1):
+            if cancelled is not None and cancelled.is_set():
+                return Detection(reason="Отменено")
             scale = width / reference_width * adjustment * factor
             w, h = (round(size * scale) for size in reversed(pattern.shape))
             if min(w, h) < 6 or w > area.shape[1] or h > area.shape[0]:
@@ -155,7 +155,7 @@ def detect(frame, templates, threshold, state_thresholds=None, current="", cance
         return Detection(reason="Нет пригодных шаблонов для кадра")
     state, (score, box, name) = ranked[0]
     minimum = (state_thresholds or {}).get(state, threshold)
-    minimum -= 0.02 if state == current else 0
+    minimum = max(0.5, minimum - 0.02) if state == current else minimum
     reason = ""
     if score < minimum:
         reason = "Совпадение ниже порога"
