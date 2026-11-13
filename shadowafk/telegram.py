@@ -29,6 +29,7 @@ class Telegram(QObject):
         config = self.read(config_path)
         self.url = os.getenv("SHADOW_SUPABASE_URL", config.get("url", "")).rstrip("/")
         self.key = os.getenv("SHADOW_SUPABASE_KEY", config.get("publishable_key", ""))
+        self._offline = offline
         self.configured = not offline and self.url.startswith("https://") and self.key.startswith("sb_publishable_")
         self.credentials = directory / "telegram-session.json"
         self.auth = self.read(self.credentials) if self.configured else {}
@@ -39,6 +40,7 @@ class Telegram(QObject):
         self.busy = False
         self.remote = {}
         self.link = ""
+        self.intent = "either"
         self.error = ""
         self.next_heartbeat = 0
         self.next_status = 0
@@ -55,6 +57,10 @@ class Telegram(QObject):
             return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
+
+    @Property(bool, constant=True)
+    def offline(self):
+        return self._offline
 
     @Property("QVariantMap", notify=changed)
     def status(self):
@@ -137,13 +143,20 @@ class Telegram(QObject):
     def result(self, code, data):
         action = self.queue[0]["action"]
         if code == 200:
+            previous = self.remote.get("state")
             self.link = data.pop("link", "") if action == "begin" else self.link
             self.remote = data
             if action == "begin":
                 self.openTelegram()
             elif data.get("state") != "pending":
                 self.link = ""
-            self.finish()
+            expired = (action == "status" and previous == "pending"
+                       and data.get("state") == "disconnected")
+            message = {
+                "register": "Регистрация не завершена. Если аккаунт уже есть, выберите вход.",
+                "login": "Вход не завершён. Если аккаунта ещё нет, выберите регистрацию.",
+            }.get(self.intent, "Срок ссылки истёк")
+            self.finish(message if expired else self.error if action == "status" and previous == "disconnected" else "")
             return
         if code == 401:
             self.auth["expires_at"] = 0
@@ -192,10 +205,15 @@ class Telegram(QObject):
     def begin(self):
         self.enqueue("begin")
 
+    @Slot(str)
+    def startAccount(self, intent):
+        self.intent = intent
+        self.enqueue("begin", intent=intent)
+
     @Slot()
     def openTelegram(self):
         if not self.link:
-            self.begin()
+            self.startAccount(self.intent)
             return
         url = urlsplit(self.link)
         if url.scheme == "https" and url.netloc == "t.me":

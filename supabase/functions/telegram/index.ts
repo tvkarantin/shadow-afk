@@ -103,7 +103,9 @@ export async function handler(request: Request) {
         return json({ error: "bot_unconfigured" }, 503);
       }
       const token = hex(crypto.getRandomValues(new Uint8Array(32)));
-      payload = { hash: hex(await digest(token)) };
+      const intent = data.intent ?? "either";
+      if (!["either", "register", "login"].includes(intent)) return json({ error: "intent" }, 400);
+      payload = { p_owner: user.id, p_hash: hex(await digest(token)), p_intent: intent };
       link = "https://t.me/" + bot + "?start=" + token;
     } else if (action === "preferences") {
       if (!Array.isArray(data.events) || data.events.length > 6 ||
@@ -121,7 +123,9 @@ export async function handler(request: Request) {
       }
       payload = { ...data, key: data.event + ":" + data.key };
     }
-    const result = await rpc("telegram_device", { p_owner: user.id, p_action: action, p_data: payload });
+    const result = action === "begin"
+      ? await rpc("telegram_begin", payload)
+      : await rpc("telegram_device", { p_owner: user.id, p_action: action, p_data: payload });
     if (result.error) return json(result, result.error === "rate_limited" ? 429 : 409);
     if (action === "notify" && await deliver(user.id, 10)) return json({ error: "delivery_failed" }, 502);
     return json({ ...result, ...(link ? { link } : {}) });

@@ -174,6 +174,7 @@ ApplicationWindow {
 
     RowLayout {
         anchors.fill: parent
+        visible: !welcome.visible
         spacing: 0
         Rectangle {
             Layout.fillHeight: true
@@ -764,6 +765,12 @@ ApplicationWindow {
                 }
             }
         }
+    }
+
+    Welcome {
+        id: welcome
+        anchors.fill: parent
+        visible: !telegram.offline && telegram.status.state !== "connected"
     }
 
     Component.onCompleted: root.stopKey = backend.settings.stopKey
